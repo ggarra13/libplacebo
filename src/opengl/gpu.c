@@ -16,6 +16,7 @@
  */
 
 #include "gpu.h"
+#include "hash.h"
 #include "common.h"
 #include "formats.h"
 #include "utils.h"
@@ -117,6 +118,9 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     int ver = pl_gl->major * 10 + pl_gl->minor;
     p->gl_ver = glsl->gles ? 0 : ver;
     p->gles_ver = glsl->gles ? ver : 0;
+    p->sig = pl_str0_hash((const char *) gl->GetString(GL_VERSION));
+    pl_hash_merge(&p->sig, pl_str0_hash((const char *) gl->GetString(GL_VENDOR)));
+    pl_hash_merge(&p->sig, pl_str0_hash((const char *) gl->GetString(GL_RENDERER)));
 
     // If possible, query the GLSL version from the implementation
     const char *glslver_p = (char *) gl->GetString(GL_SHADING_LANGUAGE_VERSION);
@@ -155,7 +159,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     }
 
     if (gl_test_ext(gpu, "GL_ARB_compute_shader", 43, 0) && glsl->version >= 420) {
-        glsl->compute = true;
+        glsl->compute = !params->no_compute;
         get(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, &glsl->max_shmem_size);
         get(GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, &glsl->max_group_threads);
         for (int i = 0; i < 3; i++)
@@ -240,20 +244,21 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
     p->has_vao = gl_test_ext(gpu, "GL_ARB_vertex_array_object", 30, 30);
     p->has_invalidate_fb = gl_test_ext(gpu, "GL_ARB_invalidate_subdata", 43, 30);
     p->has_invalidate_tex = gl_test_ext(gpu, "GL_ARB_invalidate_subdata", 43, 0);
-    p->has_queries = gl_test_ext(gpu, "GL_ARB_timer_query", 30, 30);
+    p->has_queries = gl_test_ext(gpu, "GL_ARB_timer_query", 30, 0);
     p->has_storage = gl_test_ext(gpu, "GL_ARB_shader_image_load_store", 42, 31);
     p->has_readback = true;
 
     if (p->has_readback && p->gles_ver) {
         GLuint fbo = 0, tex = 0;
         GLint read_type = 0, read_fmt = 0;
+        const GLenum target = p->gles_ver >= 30 ? GL_READ_FRAMEBUFFER : GL_FRAMEBUFFER;
         gl->GenTextures(1, &tex);
         gl->BindTexture(GL_TEXTURE_2D, tex);
         gl->GenFramebuffers(1, &fbo);
         gl->TexImage2D(GL_TEXTURE_2D, 0, GL_R8, 64, 64, 0, GL_RED,
                        GL_UNSIGNED_BYTE, NULL);
-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
-        gl->FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        gl->BindFramebuffer(target, fbo);
+        gl->FramebufferTexture2D(target, GL_COLOR_ATTACHMENT0,
                                  GL_TEXTURE_2D, tex, 0);
         gl->GetIntegerv(GL_IMPLEMENTATION_COLOR_READ_TYPE, &read_type);
         gl->GetIntegerv(GL_IMPLEMENTATION_COLOR_READ_FORMAT, &read_fmt);
@@ -264,7 +269,7 @@ pl_gpu pl_gpu_create_gl(pl_log log, pl_opengl pl_gl, const struct pl_opengl_para
                     "work around it.");
             p->has_readback = false;
         }
-        gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+        gl->BindFramebuffer(target, 0);
         gl->BindTexture(GL_TEXTURE_2D, 0);
         gl->DeleteFramebuffers(1, &fbo);
         gl->DeleteTextures(1, &tex);

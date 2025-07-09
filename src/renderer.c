@@ -1235,6 +1235,7 @@ struct plane_state {
     enum plane_type type;
     struct pl_plane plane;
     struct img img; // for per-plane shaders
+    pl_fmt fmt; // per-plane format after merge
     float plane_w, plane_h; // logical plane dimensions
 };
 
@@ -1542,6 +1543,7 @@ static bool pass_read_image(struct pass_state *pass)
                 .color = image->color,
                 .comps = image->planes[i].components,
             },
+            .fmt = image->planes[i].texture->params.format,
         };
 
         // Explicitly skip alpha channel when overridden
@@ -1625,22 +1627,32 @@ static bool pass_read_image(struct pass_state *pass)
             if (!sub)
                 break; // skip merging
 
+            int comp_map[4] = {-1, -1, -1, -1};
+            for (int ic = 0; ic < sti->img.comps; ic++) {
+                int map = sti->plane.component_mapping[sti->fmt->sample_order[ic]];
+                if (map == PL_CHANNEL_NONE)
+                    continue;
+                comp_map[fmt->sample_order[ic]] = map;
+            }
+
             sh_describe(sh, "merging planes");
             GLSL("{                 \n"
                  "vec4 tmp = "$"(); \n", sub);
             for (int jc = 0; jc < stj->img.comps; jc++) {
-                int map = stj->plane.component_mapping[jc];
+                int map = stj->plane.component_mapping[stj->fmt->sample_order[jc]];
                 if (map == PL_CHANNEL_NONE)
                     continue;
                 int ic = sti->img.comps++;
                 pl_assert(ic < 4);
                 GLSL("color[%d] = tmp[%d]; \n", ic, jc);
                 sti->plane.components = sti->img.comps;
-                sti->plane.component_mapping[ic] = map;
+                comp_map[fmt->sample_order[ic]] = map;
             }
             GLSL("} \n");
 
             sti->img.fmt = fmt;
+            sti->fmt = fmt;
+            memcpy(sti->plane.component_mapping, comp_map, sizeof(comp_map));
             pl_dispatch_abort(rr->dp, &stj->img.sh);
             *stj = (struct plane_state) {0};
             did_merge = true;
@@ -1812,6 +1824,7 @@ static bool pass_read_image(struct pass_state *pass)
             st->img.rect.x0 = st->img.rect.y0 = 0.0f;
             st->img.w = st->img.rect.x1 = src.new_w;
             st->img.h = st->img.rect.y1 = src.new_h;
+            src.scale = 1.0;
         }
 
         pass_hook(pass, &st->img, plane_scaled_hook_stages[st->type]);
@@ -1826,11 +1839,12 @@ static bool pass_read_image(struct pass_state *pass)
             pl_assert(sub);
         }
 
-        GLSL("tmp = "$"(); \n", sub);
+        GLSL("tmp = vec4("$") * "$"(); \n", SH_FLOAT(src.scale), sub);
         for (int c = 0; c < src.components; c++) {
             if (plane->component_mapping[c] < 0)
                 continue;
-            GLSL("color[%d] = tmp[%d];\n", plane->component_mapping[c], c);
+            GLSL("color[%d] = tmp[%d];\n", plane->component_mapping[c],
+                 st->fmt->sample_order[c]);
         }
 
         // we don't need it anymore
@@ -1868,7 +1882,6 @@ static bool pass_read_image(struct pass_state *pass)
         // Fix bit depth normalization before applying LUT
         float scale = pl_color_repr_normalize(&pass->img.repr);
         GLSL("color *= vec4("$"); \n", SH_FLOAT(scale));
-        pl_shader_set_alpha(sh, &pass->img.repr, PL_ALPHA_INDEPENDENT);
         pl_shader_custom_lut(sh, image->lut, &rr->lut_state[LUT_IMAGE]);
 
         if (lut_type == PL_LUT_CONVERSION) {
@@ -2411,6 +2424,12 @@ static bool pass_output_target(struct pass_state *pass)
     enum pl_clear_mode background = params->background;
     if (params->blend_against_tiles)
         background = PL_CLEAR_TILES;
+    else if (params->skip_target_clearing)
+        background = PL_CLEAR_SKIP;
+
+    /* Avoid unnecessary round trip through premultiplied alpha */
+    if (params->background_transparency >= 1.0)
+        background = PL_CLEAR_SKIP;
 
     bool has_alpha = target->repr.alpha != PL_ALPHA_NONE || params->blend_params;
     bool need_blend = background != PL_CLEAR_SKIP || !has_alpha;
@@ -2450,18 +2469,25 @@ static bool pass_output_target(struct pass_state *pass)
         }
     }
 
+
     // Apply the color scale separately, after encoding is done, to make sure
     // that the intermediate FBO (if any) has the correct precision.
     struct pl_color_repr repr = target->repr;
     float scale = pl_color_repr_normalize(&repr);
+
+    // If the alpha mode is already applied, don't double-apply it
+    if (img->repr.alpha == repr.alpha || !has_alpha || img->comps == 4) {
+        repr.alpha = PL_ALPHA_NONE;
+    } else {
+        // `pl_shader_encode_color` expects independent alpha
+        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+    }
+
     enum pl_lut_type lut_type = guess_frame_lut_type(target, true);
     if (lut_type != PL_LUT_CONVERSION)
         pl_shader_encode_color(sh, &repr);
-    if (lut_type == PL_LUT_NATIVE) {
-        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_INDEPENDENT);
+    if (lut_type == PL_LUT_NATIVE)
         pl_shader_custom_lut(sh, target->lut, &rr->lut_state[LUT_TARGET]);
-        pl_shader_set_alpha(sh, &img->repr, PL_ALPHA_PREMULTIPLIED);
-    }
 
     // Rotation handling
     if (pass->rotation % PL_ROTATION_180 == PL_ROTATION_90) {
@@ -2543,6 +2569,9 @@ static bool pass_output_target(struct pass_state *pass)
                 src.component_mask |= 1 << plane->component_mapping[c];
             }
 
+            if (params->blend_params) /* preserve alpha if blending */
+                src.component_mask |= 1 << PL_CHANNEL_A;
+
             sh = pl_dispatch_begin(rr->dp);
             dispatch_sampler(pass, sh, &rr->samplers_dst[p], SAMPLER_PLANE,
                              plane->texture, &src);
@@ -2592,7 +2621,11 @@ static bool pass_output_target(struct pass_state *pass)
             rr->prev_dither = applied_dither;
         }
 
-        GLSL("color *= vec4(1.0 / "$"); \n", SH_FLOAT(scale));
+        GLSL("color.%s *= vec%d(1.0 / "$"); \n",
+             params->blend_params ? "rgb" : "rgba",
+             params->blend_params ? 3 : 4,
+             SH_FLOAT(scale));
+
         swizzle_color(sh, plane->components, plane->component_mapping,
                       params->blend_params);
 

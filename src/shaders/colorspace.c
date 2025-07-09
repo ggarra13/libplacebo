@@ -282,9 +282,6 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
     GLSL("// pl_shader_decode_color \n"
          "{ \n");
 
-    // Do this first because the following operations are potentially nonlinear
-    pl_shader_set_alpha(sh, repr, PL_ALPHA_INDEPENDENT);
-
     if (repr->sys == PL_COLOR_SYSTEM_XYZ ||
         repr->sys == PL_COLOR_SYSTEM_DOLBYVISION)
     {
@@ -463,6 +460,7 @@ void pl_shader_decode_color(pl_shader sh, struct pl_color_repr *repr,
         GLSL("color.rgb = pow(max(color.rgb, vec3(0.0)), vec3("$")); \n", gamma);
     }
 
+    pl_shader_set_alpha(sh, repr, PL_ALPHA_INDEPENDENT);
     GLSL("}\n");
 }
 
@@ -474,6 +472,9 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
     sh_describe(sh, "color encoding");
     GLSL("// pl_shader_encode_color \n"
          "{ \n");
+
+    if (repr->alpha == PL_ALPHA_PREMULTIPLIED)
+        GLSL("color.rgb *= vec3(color.a); \n");
 
     switch (repr->sys) {
     case PL_COLOR_SYSTEM_BT_2020_C:
@@ -581,9 +582,6 @@ void pl_shader_encode_color(pl_shader sh, const struct pl_color_repr *repr)
             GLSL("color.rgb *= vec3("$"); \n", xyzscale);
         }
     }
-
-    if (repr->alpha == PL_ALPHA_PREMULTIPLIED)
-        GLSL("color.rgb *= vec3(color.a); \n");
 
     GLSL("}\n");
 }

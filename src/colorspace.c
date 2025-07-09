@@ -596,7 +596,7 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
         MAP3(powf(X, 1 / PQ_M2));
         MAP3(fmaxf(X - PQ_C1, 0) / (PQ_C2 - PQ_C3 * X));
         MAP3(10000 / PL_COLOR_SDR_WHITE * powf(X, 1 / PQ_M1));
-        return;
+        goto scale_out;
     case PL_COLOR_TRC_HLG: {
         const float y = fmaxf(1.2f + 0.42f * log10f(csp_max / HLG_REF), 1);
         const float b = sqrtf(3 * powf(csp_min / csp_max, 1 / y));
@@ -611,19 +611,19 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
         float luma = coef[0] * color[0] + coef[1] * color[1] + coef[2] * color[2];
         luma = powf(fmaxf(luma / 12, 0), y - 1);
         MAP3(luma * X / 12);
-        return;
+        goto scale_out;
     }
     case PL_COLOR_TRC_V_LOG:
         MAP3(X >= 0.181f ? powf(10, (X - VLOG_D) / VLOG_C) - VLOG_B
                          : (X - 0.125f) / 5.6f);
-        return;
+        goto scale_out;
     case PL_COLOR_TRC_S_LOG1:
         MAP3(powf(10, (X - SLOG_C) / SLOG_A) - SLOG_B);
-        return;
+        goto scale_out;
     case PL_COLOR_TRC_S_LOG2:
         MAP3(X >= SLOG_Q ? (powf(10, (X - SLOG_C) / SLOG_A) - SLOG_B) / SLOG_K2
                          : (X - SLOG_Q) / SLOG_P);
-        return;
+        goto scale_out;
     case PL_COLOR_TRC_LINEAR:
     case PL_COLOR_TRC_COUNT:
         break;
@@ -632,7 +632,8 @@ void pl_color_linearize(const struct pl_color_space *csp, float color[3])
     pl_unreachable();
 
 scale_out:
-    MAP3((csp_max - csp_min) * X + csp_min);
+    if (pl_color_space_is_black_scaled(csp) && csp->transfer != PL_COLOR_TRC_HLG)
+        MAP3((csp_max - csp_min) * X + csp_min);
 }
 
 void pl_color_delinearize(const struct pl_color_space *csp, float color[3])
@@ -1558,10 +1559,14 @@ static inline float xy_dist2(struct pl_cie_xy a, struct pl_cie_xy b)
 bool pl_primaries_compatible(const struct pl_raw_primaries *a,
                              const struct pl_raw_primaries *b)
 {
-    float RR = xy_dist2(a->red, b->red),    RG = xy_dist2(a->red, b->green),
-          RB = xy_dist2(a->red, b->blue),   GG = xy_dist2(a->green, b->green),
-          GB = xy_dist2(a->green, b->blue), BB = xy_dist2(a->blue, b->blue);
-    return RR < RG && RR < RB && GG < RG && GG < GB && BB < RB && BB < GB;
+    float RR = xy_dist2(a->red, b->red),   RG = xy_dist2(a->red, b->green),
+          RB = xy_dist2(a->red, b->blue);
+    float GR = xy_dist2(a->green, b->red), GG = xy_dist2(a->green, b->green),
+          GB = xy_dist2(a->green, b->blue);
+    float BR = xy_dist2(a->blue, b->red),  BG = xy_dist2(a->blue, b->green),
+          BB = xy_dist2(a->blue, b->blue);
+
+    return RR < RG && RR < RB && GG < GR && GG < GB && BB < BR && BB < BG;
 }
 
 // returns the intersection of the two lines defined by ab and cd
@@ -1713,8 +1718,6 @@ pl_transform3x3 pl_color_repr_decode(struct pl_color_repr *repr,
         // DCI-P3 primaries, which is a reasonable assumption.
         const struct pl_raw_primaries *dst = pl_raw_primaries_get(PL_COLOR_PRIM_DCI_P3);
         m = pl_get_xyz2rgb_matrix(dst);
-        // DCDM X'Y'Z' is expected to have equal energy white point (EG 432-1 Annex H)
-        apply_chromatic_adaptation((struct pl_cie_xy)CIE_E, dst->white, &m);
         break;
     }
     case PL_COLOR_SYSTEM_COUNT:
